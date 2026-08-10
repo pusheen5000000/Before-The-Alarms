@@ -1,0 +1,7 @@
+torch
+torchaudio
+librosa
+numpy
+scikit-learn
+soundfile
+flask
