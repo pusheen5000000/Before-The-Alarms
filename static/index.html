@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Eco-Ear Live Detector</title>
+    <style>
+      body { font-family: Arial, sans-serif; padding: 2rem; }
+      button { font-size: 1rem; padding: 0.5rem 1rem; }
+      #status { margin-top: 1rem; }
+      #prediction { margin-top: 1rem; font-size: 1.25rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Eco-Ear Live Detector</h1>
+    <p>Click "Start" to allow microphone access. The page records 2s audio clips and sends them to the server for prediction.</p>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <div id="status">Idle</div>
+    <div id="prediction"></div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
