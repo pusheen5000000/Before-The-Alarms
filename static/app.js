@@ -44,12 +44,18 @@ async function startRecording() {
     }
 
     // Get microphone stream
+    // Echo cancellation / noise suppression / AGC are tuned for voice calls:
+    // they actively suppress the transient, non-speech sounds this app needs
+    // to detect (gunshots, chainsaws, fireworks), and echoCancellation in
+    // particular will null out audio you play back through the same
+    // machine's speakers, mistaking it for acoustic echo. Turn them all off.
     audioStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         sampleRate: TARGET_SAMPLE_RATE,
-        echoCancellation: true,
-        noiseSuppression: true
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
       }
     });
 
@@ -85,6 +91,17 @@ async function startRecording() {
       if (totalSamplesRecorded < 4000) return; // Wait until at least ~0.25s recorded
 
       const snapshot = getOrderedBufferSnapshot();
+
+      // Quick sanity check: if peak amplitude is near zero, the clip is
+      // effectively silent and no model will ever classify it as anything
+      // but background -- flag that loudly instead of guessing why.
+      let peak = 0;
+      for (let i = 0; i < snapshot.length; i++) {
+        const abs = Math.abs(snapshot[i]);
+        if (abs > peak) peak = abs;
+      }
+      console.log('Clip peak amplitude:', peak.toFixed(4), peak < 0.02 ? '(near-silent!)' : '');
+
       const wavBlob = encodeWAV(snapshot, audioContext.sampleRate);
       enqueueUpload(wavBlob);
     }, 500);

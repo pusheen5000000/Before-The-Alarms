@@ -8,3 +8,4 @@ a.py
 *.mp3
 *.flac
 *.zip
+.vscode/
