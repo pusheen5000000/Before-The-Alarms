@@ -28,15 +28,18 @@ class SimpleCNN(nn.Module):
         x = F.max_pool2d(x, 2)
         x = F.relu(self.bn3(self.conv3(x)))
         x = self.pool(x)
-        x = x.view(x.size(0), -1)
+        
+        # Flatten all dimensions except batch (shape becomes 1x64 instead of 64x1)
+        x = torch.flatten(x, 1)
+        
         x = self.fc(x)
         return x
-
 
 MODEL_PATH = "pytorch_threat_model.pt"
 SR = 16000
 CLIP_SECS = 2.0
 N_MELS = 64
+BACKGROUND_THRESHOLD = float(os.getenv("BACKGROUND_THRESHOLD", "0.55"))
 
 app = Flask(__name__, static_folder="static")
 
@@ -170,6 +173,14 @@ def predict():
             idx = int(np.argmax(probs))
             class_name = CLASSES[idx]
             confidence = float(probs[idx])
+            background_idx = CLASSES.index("background") if "background" in CLASSES else None
+
+            # If the top prediction isn't background, but confidence is too low to trust:
+            if background_idx is not None and class_name != "background" and confidence < BACKGROUND_THRESHOLD:
+                class_name = "background"
+                # Set a logical confidence for fallback instead of raw low background probability
+                confidence = float(np.max([probs[background_idx], 1.0 - confidence]))
+                
     except Exception as e:
         import traceback
         tb = traceback.format_exc()

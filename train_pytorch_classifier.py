@@ -1,11 +1,4 @@
 """Train a PyTorch audio classifier on folder-structured data/
-
-Usage example:
-  python train_pytorch_classifier.py --data-dir data --epochs 30 --batch-size 16
-
-Expects `data/` to contain one subfolder per class, each with audio files.
-This script computes log-mel spectrograms with librosa, trains a small CNN,
-and saves `pytorch_threat_model.pt` on success.
 """
 
 import os
@@ -18,7 +11,7 @@ import librosa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
 
 
@@ -31,12 +24,13 @@ def set_seed(seed=42):
 
 
 class AudioDataset(Dataset):
-    def __init__(self, filepaths, labels, sample_rate=16000, clip_secs=2.0, n_mels=64):
+    def __init__(self, filepaths, labels, sample_rate=16000, clip_secs=2.0, n_mels=64, is_train=False):
         self.filepaths = filepaths
         self.labels = labels
         self.sr = sample_rate
         self.clip_len = int(sample_rate * clip_secs)
         self.n_mels = n_mels
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.filepaths)
@@ -44,16 +38,23 @@ class AudioDataset(Dataset):
     def _load(self, path):
         y, sr = librosa.load(path, sr=self.sr, mono=True)
         if len(y) < self.clip_len:
-            # pad
             pad_width = self.clip_len - len(y)
             y = np.pad(y, (0, pad_width), mode="constant")
         elif len(y) > self.clip_len:
-            # random crop
-            start = np.random.randint(0, len(y) - self.clip_len + 1)
+            # Deterministic crop for validation/testing, random crop for training
+            if self.is_train:
+                start = np.random.randint(0, len(y) - self.clip_len + 1)
+            else:
+                start = 0
             y = y[start:start + self.clip_len]
         return y
 
     def _wav_to_melspec(self, y):
+        # FIX: Check for silence / low RMS to avoid amplifying floor noise
+        rms = np.sqrt(np.mean(y**2))
+        if rms < 1e-4:
+            return np.full((self.n_mels, int(np.ceil(self.clip_len / 512))), -1.0, dtype=np.float32)
+
         melspec = librosa.feature.melspectrogram(
             y=y,
             sr=self.sr,
@@ -62,9 +63,9 @@ class AudioDataset(Dataset):
             n_mels=self.n_mels,
             power=2.0,
         )
-        log_mel = librosa.power_to_db(melspec, ref=np.max)
-        # normalize per-sample
-        log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-6)
+        # Fixed dynamic range scaling instead of per-sample variance normalization
+        log_mel = librosa.power_to_db(melspec, ref=np.max, top_db=80.0)
+        log_mel = (log_mel / 40.0) + 1.0  # Maps [-80dB, 0dB] to [-1.0, 1.0]
         return log_mel.astype(np.float32)
 
     def __getitem__(self, idx):
@@ -72,12 +73,11 @@ class AudioDataset(Dataset):
         label = self.labels[idx]
         y = self._load(path)
         spec = self._wav_to_melspec(y)
-        # shape: (n_mels, time) -> add channel dim
         spec = np.expand_dims(spec, axis=0)
         return torch.from_numpy(spec), torch.tensor(label, dtype=torch.long)
 
 
-class SimpleCNN(nn.Module):
+class ImprovedCNN(nn.Module):
     def __init__(self, n_mels=64, num_classes=2):
         super().__init__()
         self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
@@ -86,6 +86,8 @@ class SimpleCNN(nn.Module):
         self.bn2 = nn.BatchNorm2d(32)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(64)
+        
+        # Adaptive pooling across spatial dimensions (height, width) -> (1, 1)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(64, num_classes)
 
@@ -95,8 +97,14 @@ class SimpleCNN(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.max_pool2d(x, 2)
         x = F.relu(self.bn3(self.conv3(x)))
+        
+        # Pool down to (batch, 64, 1, 1)
         x = self.pool(x)
-        x = x.view(x.size(0), -1)
+        
+        # Flatten to (batch, 64)
+        x = torch.flatten(x, 1)
+        
+        # Linear layer expects (batch, 64) -> outputs (batch, num_classes)
         x = self.fc(x)
         return x
 
@@ -171,18 +179,41 @@ def main():
         print("No class folders found in", args.data_dir)
         return
     print("Classes:", classes)
-    X_train, X_val, y_train, y_val = train_test_split(
-        filepaths, labels, test_size=0.2, stratify=labels, random_state=args.seed
+
+    # Group files by original non-augmented source to prevent data leakage
+    orig_files, orig_labels = [], []
+    aug_files, aug_labels = [], []
+
+    for f, l in zip(filepaths, labels):
+        if "_aug" in os.path.basename(f):
+            aug_files.append(f)
+            aug_labels.append(l)
+        else:
+            orig_files.append(f)
+            orig_labels.append(l)
+
+    # Split only non-augmented originals
+    X_train_orig, X_val, y_train_orig, y_val = train_test_split(
+        orig_files, orig_labels, test_size=0.2, stratify=orig_labels, random_state=args.seed
     )
 
-    train_ds = AudioDataset(X_train, y_train, clip_secs=args.clip_secs, n_mels=args.n_mels)
-    val_ds = AudioDataset(X_val, y_val, clip_secs=args.clip_secs, n_mels=args.n_mels)
+    # Combine training set with augmented files
+    X_train = X_train_orig + aug_files
+    y_train = y_train_orig + aug_labels
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    train_ds = AudioDataset(X_train, y_train, clip_secs=args.clip_secs, n_mels=args.n_mels, is_train=True)
+    val_ds = AudioDataset(X_val, y_val, clip_secs=args.clip_secs, n_mels=args.n_mels, is_train=False)
+
+    class_counts = np.bincount(np.array(y_train), minlength=len(classes)).astype(np.float32)
+    class_weights = 1.0 / np.clip(class_counts, 1.0, None)
+    sample_weights = [class_weights[label] for label in y_train]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SimpleCNN(n_mels=args.n_mels, num_classes=len(classes)).to(device)
+    model = ImprovedCNN(n_mels=args.n_mels, num_classes=len(classes)).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     best_val_acc = 0.0
@@ -196,7 +227,7 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "classes": classes,
             }, "pytorch_threat_model.pt")
-            print("Saved best model (val_acc=%.3f) to pytorch_threat_model.pt" % best_val_acc)
+            print(f"Saved best model (val_acc={best_val_acc:.3f}) to pytorch_threat_model.pt")
 
 
 if __name__ == "__main__":

@@ -4,232 +4,172 @@ let statusDiv = document.getElementById('status');
 let predDiv = document.getElementById('prediction');
 
 let audioStream = null;
-let mediaRecorder = null;
+let audioContext = null;
+let scriptProcessor = null;
+let mediaStreamSource = null;
+let streamInterval = null;
+
 let isRecording = false;
 let isUploading = false;
-let chunks = [];
 let uploadQueue = [];
-const AudioCtx = window.AudioContext || window.webkitAudioContext;
-const audioContext = AudioCtx ? new AudioCtx() : null;
+
+// Audio settings matching PyTorch model expectations
+const TARGET_SAMPLE_RATE = 16000;
+const CLIP_SECS = 2.0;
+const TARGET_SAMPLES = TARGET_SAMPLE_RATE * CLIP_SECS; // 32,000 samples for 2s
+
+// Fixed-size rolling PCM buffer for the last 2 seconds
+let pcmRingBuffer = new Float32Array(TARGET_SAMPLES);
+let bufferWriteIndex = 0;
+let totalSamplesRecorded = 0;
 
 /*
- * Find a MIME type supported by the current browser.
- *
- * Chrome/Edge normally support audio/webm;codecs=opus.
- * Firefox may also support audio/ogg;codecs=opus.
- */
-function getSupportedMimeType() {
-  const types = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/ogg;codecs=opus',
-    'audio/ogg'
-  ];
-
-  for (const type of types) {
-    if (MediaRecorder.isTypeSupported(type)) {
-      return type;
-    }
-  }
-
-  return '';
-}
-
-/*
- * Start recording from the microphone.
- *
- * The recorder stays running continuously and emits a data chunk
- * every 2 seconds instead of repeatedly stopping and restarting.
+ * Start recording directly from microphone PCM stream.
  */
 async function startRecording() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    statusDiv.textContent =
-      'getUserMedia is not supported in this browser.';
+    statusDiv.textContent = 'getUserMedia is not supported in this browser.';
     return;
   }
 
-  if (typeof MediaRecorder === 'undefined') {
-    statusDiv.textContent =
-      'MediaRecorder is not available in this browser.';
-    return;
-  }
-
-  if (isRecording) {
-    return;
-  }
+  if (isRecording) return;
 
   try {
-    // Request microphone access once.
-    if (!audioStream) {
-      audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: true
-      });
+    // Initialize AudioContext at target sample rate (16kHz)
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    audioContext = new AudioCtx({ sampleRate: TARGET_SAMPLE_RATE });
+
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
     }
 
-    const mimeType = getSupportedMimeType();
-
-    if (!mimeType) {
-      statusDiv.textContent =
-        'This browser does not support a compatible audio recording format.';
-      return;
-    }
-
-    console.log('Using MediaRecorder MIME type:', mimeType);
-
-    mediaRecorder = new MediaRecorder(audioStream, {
-      mimeType: mimeType
+    // Get microphone stream
+    audioStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        sampleRate: TARGET_SAMPLE_RATE,
+        echoCancellation: true,
+        noiseSuppression: true
+      }
     });
 
-    /*
-     * Each time a 2-second chunk becomes available,
-     * upload it to the Flask server.
-     */
-    mediaRecorder.ondataavailable = (event) => {
-      if (!event.data || event.data.size === 0) return;
+    mediaStreamSource = audioContext.createMediaStreamSource(audioStream);
 
-      console.log('Received audio chunk:', event.data.size, 'bytes', event.data.type);
+    // Create a processor node to tap raw audio frames (buffer size 2048)
+    scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1);
 
-      // Keep adding to the cumulative buffer
-      chunks.push(event.data);
+    // Reset buffer tracking
+    pcmRingBuffer.fill(0);
+    bufferWriteIndex = 0;
+    totalSamplesRecorded = 0;
 
-      // Create a complete, playable WebM blob containing all chunks recorded so far
-      const currentMimeType = getSupportedMimeType() || event.data.type;
-      const cumulativeBlob = new Blob(chunks, { type: currentMimeType });
+    // Capture incoming raw PCM samples directly from microphone
+    scriptProcessor.onaudioprocess = (event) => {
+      if (!isRecording) return;
 
-      if (audioContext) {
-        convertChunkToWav(cumulativeBlob)
-          .then(wavBlob => {
-            if (wavBlob) {
-              enqueueUpload(wavBlob);
-            } else {
-              enqueueUpload(cumulativeBlob);
-            }
-          })
-          .catch(err => {
-            console.error('Chunk conversion failed:', err);
-            enqueueUpload(cumulativeBlob);
-          });
-      } else {
-        enqueueUpload(cumulativeBlob);
+      const inputData = event.inputBuffer.getChannelData(0);
+      for (let i = 0; i < inputData.length; i++) {
+        pcmRingBuffer[bufferWriteIndex] = inputData[i];
+        bufferWriteIndex = (bufferWriteIndex + 1) % TARGET_SAMPLES;
+        totalSamplesRecorded++;
       }
     };
 
-    mediaRecorder.onerror = (event) => {
-      console.error('MediaRecorder error:', event.error);
+    // Connect node graph
+    mediaStreamSource.connect(scriptProcessor);
+    scriptProcessor.connect(audioContext.destination);
 
-      statusDiv.textContent =
-        'Recording error: ' +
-        (event.error?.message || 'Unknown recording error');
-    };
+    // Send 2-second tail segment to Flask every 500ms
+    streamInterval = setInterval(() => {
+      if (!isRecording) return;
+      if (totalSamplesRecorded < 4000) return; // Wait until at least ~0.25s recorded
 
-    mediaRecorder.onstart = () => {
-      console.log('MediaRecorder started');
-      statusDiv.textContent = 'Recording...';
-    };
-
-    mediaRecorder.onstop = async () => {
-      console.log('MediaRecorder stopped');
-
-      if (chunks.length === 0) return;
-
-      try {
-        const mimeType = getSupportedMimeType() || (chunks[0] && chunks[0].type) || '';
-        const finalBlob = new Blob(chunks, { type: mimeType });
-        chunks = [];
-
-        // Try to convert the final assembled blob and enqueue it.
-        if (audioContext) {
-          try {
-            const wav = await convertChunkToWav(finalBlob);
-            if (wav) enqueueUpload(wav);
-          } catch (err) {
-            console.error('Final conversion failed, uploading raw blob instead:', err);
-            enqueueUpload(finalBlob);
-          }
-        } else {
-          enqueueUpload(finalBlob);
-        }
-      } catch (err) {
-        console.error('Failed to upload final blob:', err);
-      }
-    };
-
-    /*
-     * Start recording continuously.
-     *
-     * The 2000 argument tells MediaRecorder to emit
-     * a dataavailable event approximately every 2 seconds.
-     */
-    mediaRecorder.start(2000);
+      const snapshot = getOrderedBufferSnapshot();
+      const wavBlob = encodeWAV(snapshot, audioContext.sampleRate);
+      enqueueUpload(wavBlob);
+    }, 500);
 
     isRecording = true;
-
     startBtn.disabled = true;
     stopBtn.disabled = false;
-
     statusDiv.textContent = 'Recording...';
+    console.log('PCM Stream Recording started');
 
   } catch (error) {
     console.error('startRecording error:', error);
-
-    statusDiv.textContent =
-      'Microphone access denied or error: ' +
-      (error.message || error);
-
-    // Clean up if microphone initialization failed.
-    if (audioStream) {
-      audioStream.getTracks().forEach(track => track.stop());
-      audioStream = null;
-    }
-
-    mediaRecorder = null;
-    isRecording = false;
-
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
+    statusDiv.textContent = 'Microphone access denied or error: ' + (error.message || error);
+    cleanupAudio();
   }
 }
 
 /*
- * Stop recording.
+ * Unrolls the circular PCM ring buffer into a sequential 2-second Float32Array.
+ */
+function getOrderedBufferSnapshot() {
+  const snapshot = new Float32Array(TARGET_SAMPLES);
+  if (totalSamplesRecorded < TARGET_SAMPLES) {
+    // If less than 2 seconds recorded so far, copy from index 0
+    snapshot.set(pcmRingBuffer.subarray(0, bufferWriteIndex), 0);
+  } else {
+    // Copy oldest part from writeIndex to end, then newest part from 0 to writeIndex
+    const tailLength = TARGET_SAMPLES - bufferWriteIndex;
+    snapshot.set(pcmRingBuffer.subarray(bufferWriteIndex), 0);
+    snapshot.set(pcmRingBuffer.subarray(0, bufferWriteIndex), tailLength);
+  }
+  return snapshot;
+}
+
+/*
+ * Stop recording and cleanup audio nodes.
  */
 function stopRecording() {
-  if (!isRecording) {
-    return;
-  }
+  if (!isRecording) return;
 
   console.log('Stopping recording...');
-
   isRecording = false;
 
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    /*
-     * Calling stop() causes one final dataavailable event,
-     * so the last partial chunk will also be uploaded.
-     */
-    mediaRecorder.stop();
+  if (streamInterval) {
+    clearInterval(streamInterval);
+    streamInterval = null;
   }
+
+  cleanupAudio();
 
   startBtn.disabled = false;
   stopBtn.disabled = true;
-
   statusDiv.textContent = 'Stopped';
 }
 
-/*
- * Upload one recorded audio chunk to Flask.
- */
-async function uploadAudioChunk(blob) {
-  if (!blob || blob.size === 0) {
-    return;
+function cleanupAudio() {
+  if (scriptProcessor) {
+    scriptProcessor.disconnect();
+    scriptProcessor.onaudioprocess = null;
+    scriptProcessor = null;
   }
 
-  /*
-   * Don't start another upload if the previous request is still
-   * being processed.
-   */
+  if (mediaStreamSource) {
+    mediaStreamSource.disconnect();
+    mediaStreamSource = null;
+  }
+
+  if (audioStream) {
+    audioStream.getTracks().forEach(track => track.stop());
+    audioStream = null;
+  }
+
+  if (audioContext) {
+    audioContext.close();
+    audioContext = null;
+  }
+}
+
+/*
+ * Upload one recorded audio clip to Flask.
+ */
+async function uploadAudioChunk(blob) {
+  if (!blob || blob.size === 0) return;
+
   if (isUploading) {
-    console.warn('Previous upload still running; skipping this chunk.');
     return;
   }
 
@@ -238,25 +178,9 @@ async function uploadAudioChunk(blob) {
   try {
     statusDiv.textContent = 'Uploading clip...';
 
-    let filename = 'clip.bin';
-    if (blob.type.includes('ogg')) {
-      filename = 'clip.ogg';
-    } else if (blob.type.includes('webm')) {
-      filename = 'clip.webm';
-    } else if (blob.type.includes('wav') || blob.type.includes('wave')) {
-      filename = 'clip.wav';
-    }
-
+    const filename = 'clip.wav';
     const form = new FormData();
     form.append('file', blob, filename);
-
-    console.log(
-      'Uploading:',
-      filename,
-      blob.type,
-      blob.size,
-      'bytes'
-    );
 
     const response = await fetch('/predict', {
       method: 'POST',
@@ -267,90 +191,40 @@ async function uploadAudioChunk(blob) {
     const contentType = response.headers.get('content-type') || '';
 
     let data = null;
-
     if (contentType.includes('application/json')) {
       try {
         data = JSON.parse(text);
       } catch (error) {
-        console.error(
-          'Could not parse JSON response:',
-          text
-        );
+        console.error('Could not parse JSON response:', text);
       }
     }
 
-    /*
-     * Handle HTTP errors.
-     */
     if (!response.ok) {
-      const message =
-        data?.error ||
-        text ||
-        response.statusText;
-
-      console.error(
-        'Prediction request failed:',
-        response.status,
-        message
-      );
-
-      statusDiv.textContent =
-        'Server error: ' + message;
-
+      const message = data?.error || text || response.statusText;
+      console.error('Prediction request failed:', response.status, message);
+      statusDiv.textContent = 'Server error: ' + message;
       return;
     }
 
-    /*
-     * Handle a successful response.
-     */
     if (!data) {
       try {
         data = JSON.parse(text);
       } catch (error) {
-        console.error(
-          'Server returned invalid JSON:',
-          text
-        );
-
-        statusDiv.textContent =
-          'Server returned invalid JSON.';
-
+        console.error('Server returned invalid JSON:', text);
+        statusDiv.textContent = 'Server returned invalid JSON.';
         return;
       }
     }
 
-    /*
-     * Display the prediction.
-     */
     if (data.class !== undefined && data.confidence !== undefined) {
       const confidence = Math.round(data.confidence * 100);
-
-      predDiv.textContent =
-        `Prediction: ${data.class} ` +
-        `(confidence ${confidence}%)`;
-
+      predDiv.textContent = `Prediction: ${data.class} (confidence ${confidence}%)`;
       console.log('Prediction:', data);
     } else if (data.error) {
-      console.error(
-        'Server returned an error:',
-        data.error
-      );
-
-      statusDiv.textContent =
-        'Prediction error: ' + data.error;
-    } else {
-      console.warn(
-        'Unexpected server response:',
-        data
-      );
-
-      statusDiv.textContent =
-        'Unexpected server response.';
+      console.error('Server returned an error:', data.error);
+      statusDiv.textContent = 'Prediction error: ' + data.error;
     }
 
-    /*
-     * Only show Idle if recording has actually stopped.
-     */
     if (isRecording) {
       statusDiv.textContent = 'Recording...';
     } else {
@@ -359,27 +233,26 @@ async function uploadAudioChunk(blob) {
 
   } catch (error) {
     console.error('Upload failed:', error);
-
-    statusDiv.textContent =
-      'Upload failed: ' +
-      (error.message || error);
-
+    statusDiv.textContent = 'Upload failed: ' + (error.message || error);
   } finally {
     isUploading = false;
   }
 }
 
 /*
- * Upload queue and audio conversion helpers
+ * Upload Queue Management
  */
 function enqueueUpload(blob) {
+  // Drop older pending payloads if client gets behind to ensure zero latency
+  if (uploadQueue.length > 0) {
+    uploadQueue = [];
+  }
   uploadQueue.push(blob);
   processQueue();
 }
 
 async function processQueue() {
-  if (isUploading) return;
-  if (uploadQueue.length === 0) return;
+  if (isUploading || uploadQueue.length === 0) return;
 
   const next = uploadQueue.shift();
   try {
@@ -391,77 +264,31 @@ async function processQueue() {
   }
 }
 
-async function convertChunkToWav(blob) {
-  if (!audioContext) return null;
-
-  const arrayBuffer = await blob.arrayBuffer();
-  let decoded;
-  try {
-    decoded = await audioContext.decodeAudioData(arrayBuffer);
-  } catch (err) {
-    console.warn('decodeAudioData failed for chunk:', err);
-    return null;
-  }
-
-  const SR = 16000;
-  const clipSecs = 2.0; // Send the most recent 2 seconds
-  const totalSamples = decoded.length;
-  const maxSamples = Math.floor(clipSecs * decoded.sampleRate);
-  
-  // Determine start frame for the last 2 seconds
-  const startSample = Math.max(0, totalSamples - maxSamples);
-  const frameCount = totalSamples - startSample;
-
-  const offlineCtx = new OfflineAudioContext(1, Math.ceil((frameCount / decoded.sampleRate) * SR), SR);
-
-  // Mix channels into a mono buffer for only the tail portion
-  const mono = offlineCtx.createBuffer(1, frameCount, decoded.sampleRate);
-  const channelCount = decoded.numberOfChannels;
-  for (let i = 0; i < frameCount; i++) {
-    let sum = 0;
-    for (let ch = 0; ch < channelCount; ch++) {
-      sum += decoded.getChannelData(ch)[startSample + i];
-    }
-    mono.getChannelData(0)[i] = sum / channelCount;
-  }
-
-  const src = offlineCtx.createBufferSource();
-  src.buffer = mono;
-  src.connect(offlineCtx.destination);
-  src.start(0);
-
-  const rendered = await offlineCtx.startRendering();
-  return audioBufferToWavBlob(rendered);
-}
-
-function audioBufferToWavBlob(buffer) {
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const bitDepth = 16;
-
-  const samples = buffer.getChannelData(0);
-  const bufferLength = samples.length * (bitDepth / 8);
-  const wavBuffer = new ArrayBuffer(44 + bufferLength);
-  const view = new DataView(wavBuffer);
+/*
+ * Direct 16-bit PCM WAV Encoder
+ */
+function encodeWAV(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
 
   writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + bufferLength, true);
+  view.setUint32(4, 36 + samples.length * 2, true);
   writeString(view, 8, 'WAVE');
   writeString(view, 12, 'fmt ');
   view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // Mono channel
   view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
-  view.setUint16(32, numChannels * (bitDepth / 8), true);
-  view.setUint16(34, bitDepth, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
   writeString(view, 36, 'data');
-  view.setUint32(40, bufferLength, true);
+  view.setUint32(40, samples.length * 2, true);
 
   let offset = 44;
   for (let i = 0; i < samples.length; i++, offset += 2) {
     const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
   }
 
   return new Blob([view], { type: 'audio/wav' });

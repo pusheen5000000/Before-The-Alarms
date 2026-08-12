@@ -3,3 +3,8 @@
 AGENTS.md
 1/
 data/
+a.py
+*.wav
+*.mp3
+*.flac
+*.zip
