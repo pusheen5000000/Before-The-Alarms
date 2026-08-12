@@ -86,7 +86,22 @@ def preprocess_file(path, sr=SR, clip_secs=CLIP_SECS):
         y = np.pad(y, (0, clip_len - len(y)), mode="constant")
     elif len(y) > clip_len:
         y = y[:clip_len]
+
+    y = normalize_peak(y)
+
     return y.astype(np.float32)
+
+
+def normalize_peak(y, target_peak=0.9, min_peak=1e-4):
+    """Boost quiet clips so a faint-but-present event isn't lost in the
+    noise floor before it reaches the model. Clips that are effectively
+    true silence (peak below min_peak) are left alone -- there's nothing
+    there to boost, and amplifying pure noise just adds false signal."""
+    peak = float(np.max(np.abs(y))) if len(y) else 0.0
+    if peak < min_peak:
+        return y
+    gain = target_peak / peak
+    return y * gain
 
 
 def project_score_vector(mean_scores, class_names):
