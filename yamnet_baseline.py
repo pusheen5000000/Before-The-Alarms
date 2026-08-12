@@ -98,8 +98,16 @@ if __name__ == "__main__":
 
     target = sys.argv[1]
     if os.path.isdir(target):
-        for fname in sorted(os.listdir(target)):
-            if fname.lower().endswith((".wav", ".mp3", ".flac", ".m4a")):
-                classify_file(os.path.join(target, fname))
+        audio_files = [
+            f for f in sorted(os.listdir(target))
+            if f.lower().endswith((".wav", ".mp3", ".flac", ".m4a"))
+        ]
+        if not audio_files:
+            print(f"No audio files found directly inside '{target}'.")
+            print("(This script doesn't look inside subfolders -- point it at")
+            print(" a specific class folder like data/gunshot, not data/ itself.)")
+            sys.exit(1)
+        for fname in audio_files:
+            classify_file(os.path.join(target, fname))
     else:
         classify_file(target)
