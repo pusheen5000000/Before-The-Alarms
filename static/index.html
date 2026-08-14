@@ -2,22 +2,203 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Eco-Ear Live Detector</title>
-    <style>
-      body { font-family: Arial, sans-serif; padding: 2rem; }
-      button { font-size: 1rem; padding: 0.5rem 1rem; }
-      #status { margin-top: 1rem; }
-      #prediction { margin-top: 1rem; font-size: 1.25rem; }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Eco-Ear listens through your microphone and flags environmental threat sounds such as gunshots, chainsaws, fireworks and vehicles."
+    />
+    <title>Eco-Ear &middot; Acoustic Threat Monitor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <h1>Eco-Ear Live Detector</h1>
-    <p>Click "Start" to allow microphone access. The page records 2s audio clips and sends them to the server for prediction.</p>
-    <button id="startBtn">Start</button>
-    <button id="stopBtn" disabled>Stop</button>
-    <div id="status">Idle</div>
-    <div id="prediction"></div>
+    <a class="skip-link" href="#main">Skip to main content</a>
+
+    <div class="shell">
+      <header class="masthead">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true">
+            <!-- soundwave glyph -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
+              <path d="M3 12h1.5M7 8v8M11 4.5v15M15 8v8M19 11v2M21.5 12H23" />
+            </svg>
+          </span>
+          <div class="brand__text">
+            <h1>Eco-Ear</h1>
+            <p>Real-time acoustic threat monitoring</p>
+          </div>
+        </div>
+
+        <div class="masthead__spacer"></div>
+
+        <p class="status-pill" id="statusPill" data-state="idle">
+          <span class="status-pill__dot" aria-hidden="true"></span>
+          <span id="statusText">Idle</span>
+        </p>
+      </header>
+
+      <!-- Non-blocking error surface (mic denied, server down, ...) -->
+      <div class="banner" id="banner" data-visible="false" role="alert">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+        </svg>
+        <span id="bannerText"></span>
+      </div>
+
+      <!-- Screen-reader announcements. Kept separate from the visual nodes so
+           that styling changes can never silence them. -->
+      <p class="sr-only" id="liveStatus" role="status" aria-live="polite"></p>
+      <p class="sr-only" id="liveAlert" role="alert" aria-live="assertive"></p>
+
+      <main id="main" class="grid">
+        <!-- ============================================ left: live detector -->
+        <div class="col">
+          <section class="card" aria-labelledby="monitorHeading">
+            <div class="card__head">
+              <h2 id="monitorHeading">Live monitor</h2>
+              <span class="spacer"></span>
+              <span class="card__hint" id="clipHint">2.0 s window &middot; 16 kHz</span>
+            </div>
+
+            <div class="card__body">
+              <div class="scope" id="scope" data-active="false">
+                <canvas id="scopeCanvas" role="img"
+                        aria-label="Live microphone waveform. The numeric input level is reported below."></canvas>
+                <p class="scope__idle">Press <strong>Start listening</strong> to open the microphone</p>
+              </div>
+
+              <div class="level">
+                <span id="levelLabel">Input level</span>
+                <span class="level__track" role="meter" aria-labelledby="levelLabel"
+                      aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="levelMeter">
+                  <span class="level__fill" id="levelFill"></span>
+                </span>
+                <span class="level__value" id="levelValue">0%</span>
+              </div>
+              <p class="level__warn" id="levelWarn"></p>
+
+              <div class="controls">
+                <button type="button" class="btn btn--primary" id="startBtn">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" aria-hidden="true">
+                    <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                    <path d="M5 11a7 7 0 0 0 14 0M12 18v4" />
+                  </svg>
+                  Start listening
+                </button>
+                <button type="button" class="btn btn--danger" id="stopBtn" disabled>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" aria-hidden="true">
+                    <rect x="6" y="6" width="12" height="12" rx="2" />
+                  </svg>
+                  Stop
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section class="card" aria-labelledby="verdictHeading">
+            <div class="card__head">
+              <h2 id="verdictHeading">Current detection</h2>
+              <span class="spacer"></span>
+              <span class="card__hint" id="latencyHint"></span>
+            </div>
+
+            <div class="card__body">
+              <div class="verdict" id="verdict" data-threat="false">
+                <div class="verdict__dial" aria-hidden="true">
+                  <svg viewBox="0 0 120 120">
+                    <circle class="track" cx="60" cy="60" r="50" />
+                    <!-- 2*pi*50 = 314.16 -->
+                    <circle class="arc" id="verdictArc" cx="60" cy="60" r="50"
+                            stroke-dasharray="314.16" stroke-dashoffset="314.16" />
+                  </svg>
+                  <span class="verdict__pct"><span id="verdictPct">--</span><small>confidence</small></span>
+                </div>
+
+                <div class="verdict__text">
+                  <p class="verdict__label" id="verdictLabel">Awaiting audio</p>
+                  <p class="verdict__sub" id="verdictSub">
+                    Start the monitor or drop an audio file to classify.
+                  </p>
+                  <ul class="verdict__tags" id="verdictTags" aria-label="Top underlying YAMNet labels"></ul>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="card" aria-labelledby="breakdownHeading">
+            <div class="card__head">
+              <h2 id="breakdownHeading">Class breakdown</h2>
+            </div>
+            <div class="card__body">
+              <ul class="meters" id="meters"></ul>
+              <p class="threshold-note">
+                A threat class must exceed <code id="thresholdText">--</code> to beat
+                <code>background</code>.
+              </p>
+            </div>
+          </section>
+        </div>
+
+        <!-- ============================================ right: log + upload -->
+        <div class="col">
+          <section class="card" aria-labelledby="statsHeading">
+            <div class="card__head">
+              <h2 id="statsHeading">Session</h2>
+            </div>
+            <div class="card__body">
+              <dl class="stats">
+                <div>
+                  <dt>Clips</dt>
+                  <dd id="statClips">0</dd>
+                </div>
+                <div>
+                  <dt>Threats</dt>
+                  <dd id="statThreats">0</dd>
+                </div>
+                <div>
+                  <dt>Uptime</dt>
+                  <dd id="statUptime">0:00</dd>
+                </div>
+              </dl>
+            </div>
+          </section>
+
+          <section class="card" aria-labelledby="logHeading">
+            <div class="card__head">
+              <h2 id="logHeading">Threat log</h2>
+              <span class="spacer"></span>
+              <button type="button" class="btn btn--ghost" id="clearLogBtn">Clear</button>
+            </div>
+            <div class="card__body">
+              <p class="empty" id="logEmpty">No threats detected yet.</p>
+              <ul class="log" id="log" aria-labelledby="logHeading"></ul>
+            </div>
+          </section>
+
+          <section class="card" aria-labelledby="uploadHeading">
+            <div class="card__head">
+              <h2 id="uploadHeading">Classify a file</h2>
+            </div>
+            <div class="card__body">
+              <label class="drop" id="drop" for="fileInput" data-drag="false">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5-5 5 5M12 5v13" />
+                </svg>
+                <span class="drop__title">Drop an audio clip, or browse</span>
+                <span class="drop__hint">WAV, MP3, OGG, FLAC, WebM &middot; first 2 s analysed</span>
+                <input type="file" id="fileInput" accept="audio/*,.wav,.mp3,.ogg,.flac,.webm,.m4a" />
+              </label>
+              <p class="file-status" id="fileStatus" aria-live="polite"></p>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <p class="foot">
+        YAMNet embeddings mapped onto project classes with noisy-OR combination.
+        Tune sensitivity with the <code>BACKGROUND_THRESHOLD</code> environment variable.
+      </p>
+    </div>
 
     <script src="/static/app.js"></script>
   </body>
