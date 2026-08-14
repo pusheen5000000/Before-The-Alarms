@@ -79,7 +79,7 @@ CLASS_TOP_K = {
     "gunshot": 6,     # only 6 labels, keep all
     "chainsaw": 3,
     "firework": 4,
-    "vehicle": 5,     # only the 5 strongest vehicle labels count
+    "vehicle": 3,     # only the 3 strongest vehicle labels count
 }
 
 
@@ -172,7 +172,7 @@ def well_known(subpath):
     return ('', 204)
 
 
-def preprocess_file(path, sr=SR, clip_secs=CLIP_SECS):
+def preprocess_file(path, sr=SR, clip_secs=CLIP_SECS, normalize=True):
     y, _ = librosa.load(path, sr=sr, mono=True)
     clip_len = int(sr * clip_secs)
     if len(y) < clip_len:
@@ -180,7 +180,13 @@ def preprocess_file(path, sr=SR, clip_secs=CLIP_SECS):
     elif len(y) > clip_len:
         y = y[:clip_len]
 
-    y = normalize_peak(y)
+    # Only normalize uploaded files (not live mic clips). Live mic audio
+    # should reach YAMNet at the level it was captured — normalizing quiet
+    # noise makes YAMNet hallucinate "Waterfall"/"Water", and normalizing
+    # the tail of a gunshot equally with its transient makes it look like
+    # sustained engine noise.
+    if normalize:
+        y = normalize_peak(y)
 
     return y.astype(np.float32)
 
@@ -209,15 +215,22 @@ def project_score_vector(mean_scores, class_names):
     # Gather per-class scores from YAMNet labels.
     class_scores = {name: [] for name in PROJECT_CLASSES if name != "background"}
 
-    # Per-label floor: YAMNet outputs below this are model noise, not
-    # meaningful detections. Without this, white noise / ambient mic hiss
-    # produces dozens of labels at 0.02-0.05 that compound via noisy-OR
-    # into a false vehicle detection.
-    LABEL_FLOOR = 0.08
+    # Per-class label floor: scores below this are treated as model noise.
+    # Vehicle needs a high floor (0.10) because it has many labels that fire
+    # weakly on unrelated audio. Gunshot needs a low floor (0.03) because
+    # speaker + room coloring attenuates the transient — "Explosion" might
+    # only score 0.04-0.07 through a speaker but that's still a real detection.
+    CLASS_LABEL_FLOOR = {
+        "gunshot": 0.03,
+        "chainsaw": 0.06,
+        "firework": 0.04,
+        "vehicle": 0.10,
+    }
 
     for idx, project_label in YAMNET_LABEL_INDEX.items():
         score = min(max(float(mean_scores[idx]), 0.0), 1.0)
-        if score >= LABEL_FLOOR:
+        floor = CLASS_LABEL_FLOOR.get(project_label, 0.08)
+        if score >= floor:
             class_scores[project_label].append(score)
 
     # Noisy-OR of only the top-K strongest-firing labels per class.
@@ -341,8 +354,12 @@ def predict():
 
     try:
         f.save(tmp_path)
+        # Live mic clips (named "clip.wav" by the JS) should NOT be normalized:
+        # the audio level as captured is meaningful. Uploaded files might be
+        # quiet recordings that benefit from normalization.
+        is_live_mic = filename.lower() in ("clip.wav", "")
         try:
-            audio = preprocess_file(tmp_path)
+            audio = preprocess_file(tmp_path, normalize=not is_live_mic)
         except Exception as e:
             import traceback, subprocess
             tb = traceback.format_exc()
@@ -362,7 +379,7 @@ def predict():
                 ]
                 subprocess.check_output(cmd, stderr=subprocess.STDOUT)
                 app.logger.info(f"ffmpeg conversion succeeded: {converted}")
-                audio = preprocess_file(converted)
+                audio = preprocess_file(converted, normalize=not is_live_mic)
             except FileNotFoundError:
                 app.logger.error("ffmpeg not found; install ffmpeg to enable server-side conversion")
                 return jsonify({"error": f"Failed to process audio: {e}", "trace": tb, "hint": "Install ffmpeg for server-side conversion"}), 500
